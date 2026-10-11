@@ -680,10 +680,18 @@ function isConfigured(provider) {
 
 // A row whose fetch failed (or whose data went missing) still earns a slot:
 // the UI renders it as a muted card / grey light instead of dropping it.
-// Unconfigured providers (no-credentials) are the one state that stays hidden.
+// Rows that were never configured (nothing to auth with, opt-in never
+// enabled, logged out) are the one state that stays hidden on both surfaces.
+const UNCONFIGURED_REASONS = new Set([
+	"no-credentials", "opt-in-disabled", "not-logged-in", "no-session-cookies",
+]);
+function isUnconfigured(provider) {
+	return Boolean(provider && provider.unavailable_reason
+		&& UNCONFIGURED_REASONS.has(provider.unavailable_reason));
+}
 function isNoData(provider) {
 	return Boolean(provider && provider.unavailable_reason
-		&& provider.unavailable_reason !== "no-credentials");
+		&& !UNCONFIGURED_REASONS.has(provider.unavailable_reason));
 }
 
 // Re-render on an interval so relative countdowns tick live.
@@ -1237,7 +1245,7 @@ function useCodexStale(data, untrusted = false) {
 
 function statusEntries(providers, stale = false) {
 	return Object.entries(providers || {}).map(([pid, provider]) => {
-		const accounts = pid === "openai-codex" && provider && provider.unavailable_reason !== "no-credentials"
+		const accounts = pid === "openai-codex" && provider && !isUnconfigured(provider)
 			? providerEntries({ [pid]: provider }).map(([, p]) => p).filter(asProvider) : [];
 		if (!accounts.length) return [pid, provider];
 		// A lone account needs no distinguishing name in the compact status bar.
@@ -2005,13 +2013,13 @@ function QuotaPane() {
 		});
 	} else {
 		const disabled = disabledProvidersAtom.get();
-		// Default view: only providers with real data. Providers without data
-		// (unconfigured / opt-in off) collapse into a muted "no data" section.
-		// Rows that share a base provider (saved pool accounts) are grouped:
+		// Default view: only providers with real data. Never-configured rows
+		// (no-credentials / opt-in off / logged out) are dropped above. Rows
+		// that share a base provider (saved pool accounts) are grouped:
 		// two or more sibling rows become one card group with a per-card
 		// button, while a lone row keeps the plain card path unchanged.
 		const all = providerEntries(data.providers).filter(
-			([pid]) => !disabled.includes(pid),
+			([pid, p]) => !disabled.includes(pid) && !isUnconfigured(p),
 		);
 		const groups = [];
 		const groupByBase = new Map();
@@ -2026,10 +2034,11 @@ function QuotaPane() {
 			group.entries.push(entry);
 			group.hasData = group.hasData || Boolean(isConfigured(entry[1]));
 		}
-		// Providers without data (unconfigured / opt-in off) and without a
-		// sibling group collapse into the muted section, as before. A lone
-		// row whose fetch failed (no-data) is not "unconfigured": it keeps a
-		// muted card in the main list instead of vanishing behind the fold.
+		// Unconfigured rows never reach this point (filtered above), so a
+		// lone row here is either healthy or failed. A failure is not
+		// "unconfigured": it keeps a muted card in the main list instead of
+		// vanishing behind the fold; the fold below is kept for markup
+		// stability but no longer holds any row.
 		const visible = groups.filter(
 			(group) => group.entries.length >= 2 || group.hasData
 				|| group.entries.some(([, p]) => isNoData(p)),

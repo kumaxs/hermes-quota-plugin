@@ -74,6 +74,18 @@ def single_row_data(unavailable='fetch-error:OSError', provider='deepseek'):
                    'unavailable_reason': unavailable}}}
 
 
+def pool_data_with_unconfigured_sibling():
+    """Three-row pool: base + one healthy sibling + one no-credentials row."""
+    providers = {}
+    base = card('alpha.gmail', 50.0)
+    base['label'] = 'commandcode'
+    providers['commandcode'] = base
+    providers['commandcode:r2'] = card(
+        'beta.gmail', None, account_id='r2', unavailable='no-credentials')
+    providers['commandcode:r3'] = card('gamma.gmail', 90.0, account_id='r3')
+    return {'fetched_at': '2026-01-02T03:04:05Z', 'age_s': 3, 'providers': providers}
+
+
 def flat(tree):
     """Every node in document order; scalar leaves (text) included."""
     out = []
@@ -363,14 +375,50 @@ class MultiCardPaneTests(unittest.TestCase):
         self.assertEqual(buttons, [])
         self.assertEqual(lights, [])
 
-    def test_pane_single_unconfigured_provider_stays_in_the_no_data_section(self):
-        # Guard (green before and after the fix): a no-credentials row keeps
-        # its place under the collapsed "No data" section.
+    # ---- correction round 3: unconfigured rows stay hidden everywhere ------
+
+    # Round 3 rewrite (was ..._stays_in_the_no_data_section): the round-2
+    # expectation kept a no-credentials row in the pane's collapsed "No data"
+    # section. The distinction is per reason: never-configured rows leave
+    # both surfaces entirely; only fetch failures keep their grey slot.
+    def test_pane_single_unconfigured_provider_is_hidden_entirely(self):
         out = render(data=single_row_data('no-credentials'))
         tree = out['before']
-        chain = path_types(tree, 'DeepSeek')
-        self.assertIsNotNone(chain, 'the unconfigured provider row is missing')
-        self.assertIn('details', chain)
+        self.assertIsNone(path_types(tree, 'DeepSeek'))
+        self.assertNotIn('details', json.dumps(tree))
+
+    def test_status_bar_single_opt_in_disabled_provider_stays_hidden(self):
+        # Round 3 (red before the fix: probe S2 rendered one grey chip): a
+        # subscription that was never enabled counts as unconfigured, not as
+        # a failed fetch — it contributes no button and no light.
+        out = render(component='status',
+                     data=single_row_data('opt-in-disabled', provider='antigravity'))
+        buttons, lights = status_parts(out['before'])
+        self.assertEqual(buttons, [])
+        self.assertEqual(lights, [])
+
+    def test_pane_single_opt_in_disabled_provider_stays_hidden(self):
+        # Round 3 (red before the fix: probe S2p carded it in the main area):
+        # the pane drops a never-configured row entirely — no card, no
+        # "No data" fold entry, no reason text.
+        out = render(data=single_row_data('opt-in-disabled', provider='antigravity'))
+        tree = out['before']
+        self.assertIsNone(path_types(tree, 'Antigravity'))
+        self.assertNotIn('details', json.dumps(tree))
+        self.assertNotIn('opt-in-disabled', json.dumps(tree))
+
+    def test_pane_and_status_agree_on_an_unconfigured_pool_sibling(self):
+        # Round 3 (red before the fix: probe S8p kept 3 pane cards against
+        # the 2 status lights): the no-credentials sibling is dropped from
+        # BOTH surfaces; the pane keeps only the two real cards.
+        data = pool_data_with_unconfigured_sibling()
+        pane = render(data=data)
+        self.assertEqual(len(card_buttons(pane['before'])), 2)
+        self.assertEqual(pane['tones'], ['good', 'bad'])
+        status = render(component='status', data=data)
+        buttons, lights = status_parts(status['before'])
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(light_colors(lights), [GOOD, BAD])
 
 
 if __name__ == '__main__':
