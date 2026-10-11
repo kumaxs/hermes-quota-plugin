@@ -23,6 +23,7 @@ LABELS = ('alpha.gmail', 'beta.gmail', 'gamma.gmail', 'delta.mail')
 
 # toneColor() values of the shared light contract.
 GOOD, WARN, BAD = 'var(--ui-accent)', 'var(--ui-yellow)', 'var(--ui-red)'
+GREY = 'var(--ui-stroke-tertiary)'  # toneColor('muted')
 
 
 def render(**options):
@@ -64,6 +65,13 @@ def pool_data(percents, labels=LABELS):
             record['label'] = 'commandcode'
         providers['commandcode' if index == 0 else f'commandcode:r{index + 1}'] = record
     return {'fetched_at': '2026-01-02T03:04:05Z', 'age_s': 3, 'providers': providers}
+
+
+def single_row_data(unavailable='fetch-error:OSError', provider='deepseek'):
+    """One lone provider row carrying an unavailable reason."""
+    return {'fetched_at': '2026-01-02T03:04:05Z', 'age_s': 3, 'providers': {
+        provider: {'windows': [{'label': 'Weekly', 'used_percent': 10.0}],
+                   'unavailable_reason': unavailable}}}
 
 
 def flat(tree):
@@ -117,6 +125,25 @@ def box_with_text(tree, marker):
                 and marker in text(n)):
             return n
     raise AssertionError(f'no elevated card box for {marker!r}')
+
+
+def path_types(tree, marker):
+    """Types from the root down to the dict whose children is the marker string."""
+    def walk(node, types):
+        if isinstance(node, dict):
+            here = types + [node.get('type')]
+            children = node.get('props', {}).get('children')
+            if isinstance(children, str) and children == marker:
+                return here
+            return walk(children, here)
+        if isinstance(node, list):
+            for item in node:
+                found = walk(item, types)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(tree, [])
 
 
 @unittest.skipUnless(shutil.which('node'), 'Node.js is required for widget render tests')
@@ -239,13 +266,15 @@ class MultiCardPaneTests(unittest.TestCase):
         self.assertIn('Anthropic', text(buttons[0]))
         self.assertNotIn('%', text(buttons[0]))
 
-    def test_status_bar_merge_keeps_hiding_failed_rows_behind_the_gate(self):
-        # The merge must not resurrect rows the status bar already hides:
-        # 3 healthy cards + 1 read failure -> three lights, never four.
+    def test_status_bar_merge_keeps_a_failed_row_as_a_grey_light(self):
+        # Round 2 rewrites the round-1 expectation: the failed row used to be
+        # swallowed by the gate at plugin.js:1431, so four cards rendered
+        # three lights. The failed row now keeps its own slot as a grey
+        # light, and the healthy lights never shift.
         out = render(component='status', data=pool_data((50.0, 70.0, 90.0, None)))
         buttons, lights = status_parts(out['before'])
         self.assertEqual(len(buttons), 1)
-        self.assertEqual(light_colors(lights), [GOOD, WARN, BAD])
+        self.assertEqual(light_colors(lights), [GOOD, WARN, BAD, GREY])
 
     def test_group_card_buttons_live_inside_the_selected_card_header(self):
         # Fix round (2/5): the per-card buttons moved into the selected card
@@ -283,6 +312,65 @@ class MultiCardPaneTests(unittest.TestCase):
         self.assertEqual(box_with_text(out['before'], 'DeepSeek'),
                          box_with_text(out['after'], 'DeepSeek'),
                          'another provider was re-rendered by the click')
+
+    # ---- correction round 2: no-data rows keep a grey light ----------------
+
+    def test_status_bar_failed_row_keeps_a_grey_light_in_place(self):
+        # Round 2: a read failure at the second card keeps its own grey light
+        # in row order; the siblings after it never shift left.
+        out = render(component='status', data=pool_data((50.0, None, 90.0, 95.0)))
+        buttons, lights = status_parts(out['before'])
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(light_colors(lights), [GOOD, GREY, BAD, BAD])
+
+    def test_status_bar_single_failed_provider_gets_a_grey_chip(self):
+        # Round 2: a lone provider that failed to fetch still renders a chip
+        # with a grey light and the "unavailable" value (no longer dropped).
+        out = render(component='status', data=single_row_data('fetch-error:OSError'))
+        buttons, lights = status_parts(out['before'])
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(light_colors(lights), [GREY])
+        spans = buttons[0]['props']['children']
+        self.assertEqual(len(spans), 3)
+        self.assertIn('h-1.5 w-1.5 rounded-full', spans[0]['props']['className'])
+        self.assertEqual(spans[1]['props']['children'], 'DeepSeek')
+        self.assertEqual(spans[2]['props']['children'], 'unavailable')
+
+    def test_status_bar_full_pool_of_read_failures_keeps_all_grey_lights(self):
+        # Round 2: when every row of a saved pool failed, the cell keeps one
+        # grey light per card instead of falling back to the global dot.
+        out = render(component='status', data=pool_data((None, None, None, None)))
+        buttons, lights = status_parts(out['before'])
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(light_colors(lights), [GREY, GREY, GREY, GREY])
+        self.assertIn('CommandCode', text(buttons[0]))
+
+    def test_pane_single_failed_provider_stays_in_the_main_flow(self):
+        # Round 2 (red before the fix: folded under "No data"): a lone row
+        # whose fetch failed keeps its muted card in the main list.
+        out = render(data=single_row_data('fetch-error:OSError'))
+        tree = out['before']
+        chain = path_types(tree, 'DeepSeek')
+        self.assertIsNotNone(chain, 'the failed provider card is missing')
+        self.assertNotIn('details', chain)
+        self.assertIn('fetch-error:OSError', json.dumps(tree))
+
+    def test_status_bar_single_unconfigured_provider_stays_hidden(self):
+        # Guard (green before and after the fix): no-credentials is not
+        # "no data" — an unconfigured provider keeps the bar empty.
+        out = render(component='status', data=single_row_data('no-credentials'))
+        buttons, lights = status_parts(out['before'])
+        self.assertEqual(buttons, [])
+        self.assertEqual(lights, [])
+
+    def test_pane_single_unconfigured_provider_stays_in_the_no_data_section(self):
+        # Guard (green before and after the fix): a no-credentials row keeps
+        # its place under the collapsed "No data" section.
+        out = render(data=single_row_data('no-credentials'))
+        tree = out['before']
+        chain = path_types(tree, 'DeepSeek')
+        self.assertIsNotNone(chain, 'the unconfigured provider row is missing')
+        self.assertIn('details', chain)
 
 
 if __name__ == '__main__':

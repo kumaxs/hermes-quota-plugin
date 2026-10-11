@@ -678,6 +678,14 @@ function isConfigured(provider) {
 	return provider && !provider.unavailable_reason;
 }
 
+// A row whose fetch failed (or whose data went missing) still earns a slot:
+// the UI renders it as a muted card / grey light instead of dropping it.
+// Unconfigured providers (no-credentials) are the one state that stays hidden.
+function isNoData(provider) {
+	return Boolean(provider && provider.unavailable_reason
+		&& provider.unavailable_reason !== "no-credentials");
+}
+
 // Re-render on an interval so relative countdowns tick live.
 function useNow(intervalMs = 30_000) {
 	const [now, setNow] = useState(() => Date.now());
@@ -1425,10 +1433,11 @@ function StatusBar() {
 	if (!data || !data.providers)
 		return jsx(StatusDot, { tone: "muted" });
 	// Keep unavailable saved accounts visible alongside healthy siblings.
-	// Unconfigured providers remain hidden; visibility settings apply to all accounts.
+	// A failed fetch (no-data) keeps its own slot as a muted light; only
+	// unconfigured providers stay hidden; visibility settings apply to all accounts.
 	const entries = statusEntries(data.providers, stale)
 		.filter(([pid]) => (!isError || pid === "openai-codex") && isProviderEnabled(pid))
-		.filter(([, p]) => p?.display_accounts || isConfigured(p));
+		.filter(([, p]) => p?.display_accounts || isConfigured(p) || isNoData(p));
 	if (entries.length === 0) return jsx(StatusDot, { tone: "muted" });
 	// Sibling rows of one provider merge into a single cell (one light per
 	// card plus the base name); a lone row keeps the original chip unchanged.
@@ -2018,12 +2027,16 @@ function QuotaPane() {
 			group.hasData = group.hasData || Boolean(isConfigured(entry[1]));
 		}
 		// Providers without data (unconfigured / opt-in off) and without a
-		// sibling group collapse into the muted section, as before.
+		// sibling group collapse into the muted section, as before. A lone
+		// row whose fetch failed (no-data) is not "unconfigured": it keeps a
+		// muted card in the main list instead of vanishing behind the fold.
 		const visible = groups.filter(
-			(group) => group.entries.length >= 2 || group.hasData,
+			(group) => group.entries.length >= 2 || group.hasData
+				|| group.entries.some(([, p]) => isNoData(p)),
 		);
 		const withoutData = groups.filter(
-			(group) => group.entries.length === 1 && !group.hasData,
+			(group) => group.entries.length === 1 && !group.hasData
+				&& !isNoData(group.entries[0][1]),
 		);
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
