@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import QuotaAccount, QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
 from .registry import register as _register
 
 _PROVIDER = "commandcode"
@@ -80,6 +80,96 @@ def _load_api_key() -> Optional[str]:
         pass
     return None
 
+
+def _clean_text(value: Any, limit: int = 64) -> str:
+    """Strip control characters and bound a saved row's display text."""
+    if not isinstance(value, str):
+        return ""
+    text = "".join(char for char in value if ord(char) >= 32 and ord(char) != 127)
+    return text.strip()[:limit]
+
+
+def _pool_rows_from_store() -> list[dict[str, Any]]:
+    """Enumerate saved rows straight from ``auth.json`` (read-only fallback).
+
+    Only used when the Hermes core is not importable. The profile pool wins
+    over the global one, mirroring the core's own precedence; an unreadable
+    store is an empty pool — never a write, never a fatal error.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+    except Exception:  # noqa: BLE001 - core absent, nothing to read
+        return []
+    stores: list[tuple[Any, dict[str, Any]]] = []
+    for home in (get_hermes_home(), get_default_hermes_root()):
+        if home in [known for known, _ in stores]:
+            continue
+        try:
+            with open(os.path.join(str(home), "auth.json"), "r", encoding="utf-8-sig") as fh:
+                store = json.load(fh)
+        except (OSError, ValueError, UnicodeError):
+            store = {}
+        stores.append((home, store if isinstance(store, dict) else {}))
+    local_rows = (stores[0][1].get("credential_pool") or {}).get(_PROVIDER) if stores else []
+    global_rows = (
+        (stores[1][1].get("credential_pool") or {}).get(_PROVIDER) if len(stores) > 1 else []
+    )
+    entries = local_rows if isinstance(local_rows, list) and local_rows else global_rows
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _pool_rows() -> list[dict[str, Any]]:
+    """One row per saved CommandCode credential, without selecting/rotating.
+
+    The core reader is profile-aware and already resolves env-backed rows; the
+    direct read is the read-only fallback when the core is not importable.
+    """
+    try:
+        from hermes_cli.auth import read_credential_pool
+
+        return [row for row in (read_credential_pool(_PROVIDER) or []) if isinstance(row, dict)]
+    except Exception:  # noqa: BLE001 - core absent or the saved store is unreadable
+        return _pool_rows_from_store()
+
+
+def _env_secret(name: str) -> Optional[str]:
+    try:
+        from hermes_cli.config import get_env_value_prefer_dotenv
+
+        return get_env_value_prefer_dotenv(name)
+    except Exception:  # noqa: BLE001 - core absent; the process env still counts
+        return os.environ.get(name)
+
+
+def _credential_rows() -> list[tuple[Optional[str], str, str]]:
+    """(account id, display label, secret) for every saved row, deduplicated.
+
+    Equality-only deduplication by secret: two rows that point at the same
+    credential are one card, and no id/hash/suffix is ever derived here.
+    """
+    rows: list[tuple[Optional[str], str, str]] = []
+    seen: set[str] = set()
+    for entry in _pool_rows():
+        secret = entry.get("access_token") or entry.get("runtime_api_key")
+        if not (isinstance(secret, str) and secret.strip()):
+            source = entry.get("source")
+            if isinstance(source, str) and source.startswith("env:"):
+                env_name = source.split(":", 1)[1].strip()
+                value = _env_secret(env_name) if env_name else None
+                secret = value if isinstance(value, str) and value.strip() else None
+        if not (isinstance(secret, str) and secret.strip()):
+            continue
+        secret = secret.strip()
+        if secret in seen:
+            continue
+        seen.add(secret)
+        account_id = _clean_text(entry.get("id"))
+        rows.append(
+            (account_id or None, _clean_text(entry.get("label")) or account_id, secret)
+        )
+    return rows
 
 
 def _get(path: str, key: str) -> Any:
@@ -303,11 +393,20 @@ def fetch_commandcode_quota() -> QuotaResult:
 
 
 def _fetch() -> QuotaResult:
+    # Multi-card: two or more saved credential rows each get their own card
+    # (one saved pool row per card); zero or one rows keep the original
+    # single-card path unchanged.
+    rows = _credential_rows()
+    if len(rows) >= 2:
+        return _fetch_cards(rows)
     key = _load_api_key()
     if not key:
         return build_unavailable(_PROVIDER, "no-credentials")
+    return _fetch_card(key, time.monotonic() + _REQUEST_DEADLINE_S)
 
-    deadline = time.monotonic() + _REQUEST_DEADLINE_S
+
+def _fetch_card(key: str, deadline: float) -> QuotaResult:
+    """One credential's complete request group (raises only on bugs)."""
 
     # The official CLI probes whoami first, then uses its org.id for all billing
     # and usage calls.  If this auxiliary probe is unavailable, continue without
@@ -398,6 +497,60 @@ def _fetch() -> QuotaResult:
         unavailable_reason=None,
         details=details,
     )
+
+
+def _fetch_cards(rows: list[tuple[Optional[str], str, str]]) -> QuotaResult:
+    """Fetch every saved row concurrently on one shared deadline.
+
+    The first row keeps the plain ``commandcode`` row (its saved label becomes
+    ``account_label``); every other row becomes a named account row. One row's
+    failure is that row's typed unavailable card and never masks a sibling.
+    """
+    deadline = time.monotonic() + _REQUEST_DEADLINE_S
+    results: list[Optional[QuotaResult]] = [None] * len(rows)
+    events: list[threading.Event] = []
+    lock = threading.Lock()
+
+    def worker(index: int, key: str, event: threading.Event) -> None:
+        try:
+            card = _fetch_card(key, deadline)
+        except Exception as exc:  # one row must not sink its siblings
+            card = build_unavailable(_PROVIDER, f"fetch-error:{type(exc).__name__}")
+        with lock:
+            if results[index] is None:
+                results[index] = card
+        event.set()
+
+    for index, (_account_id, _label, key) in enumerate(rows):
+        event = threading.Event()
+        events.append(event)
+        threading.Thread(
+            target=worker,
+            args=(index, key, event),
+            name=f"commandcode-row{index}",
+            daemon=True,
+        ).start()
+    for event in events:
+        event.wait(max(0.0, deadline - time.monotonic()))
+
+    cards: list[QuotaResult] = []
+    for index, event in enumerate(events):
+        card = results[index] if event.is_set() else None
+        cards.append(card if card is not None else build_unavailable(_PROVIDER, "timeout"))
+    base = cards[0]
+    base.account_label = rows[0][1] or None
+    base.accounts.extend(
+        QuotaAccount(
+            id=account_id,
+            label=label,
+            windows=list(row_card.windows or []),
+            plan=row_card.plan,
+            unavailable_reason=row_card.unavailable_reason,
+            details=list(row_card.details or []),
+        )
+        for (account_id, label, _key), row_card in zip(rows[1:], cards[1:])
+    )
+    return base
 
 
 _register(_PROVIDER)(fetch_commandcode_quota)

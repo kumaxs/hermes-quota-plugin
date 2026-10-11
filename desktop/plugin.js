@@ -1557,6 +1557,55 @@ function ProviderRow({ id, provider }) {
 	});
 }
 
+// One group of rows that share a base provider (saved pool accounts): a row
+// of buttons — the row's own label plus its status tone — and, below it, the
+// selected card rendered by the same ProviderRow as every single-card
+// provider, so the detail keeps the full single-card completeness. A lone row
+// never reaches this component; the pane keeps its plain card path as-is.
+function ProviderCardGroup({ entries }) {
+	const [selected, setSelected] = useState(0);
+	// A refresh can remove or reorder rows: clamp instead of blanking the UI.
+	const index = Math.max(0, Math.min(selected, entries.length - 1));
+	const [selectedId, selectedProvider] = entries[index];
+	return jsxs("div", {
+		className: "flex flex-col gap-2",
+		children: [
+			jsx("div", {
+				className: "flex items-center gap-2",
+				style: { flexWrap: "wrap" },
+				children: entries.map(([pid, provider], i) => {
+					const account =
+						provider && typeof provider.account_label === "string"
+							? provider.account_label.trim()
+							: "";
+					return jsxs(
+						"button",
+						{
+							type: "button",
+							"aria-pressed": i === index,
+							className: cn(
+								"inline-flex items-center gap-2 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2.5",
+								"text-xs text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
+							),
+							style:
+								i === index
+									? { background: "var(--ui-control-hover-background)" }
+									: undefined,
+							onClick: () => setSelected(i),
+							children: [
+								jsx("span", { children: account || providerDisplayName(pid, provider) }),
+								jsx(StatusDot, { tone: providerTone(provider) }),
+							],
+						},
+						`${pid}-${i}`,
+					);
+				}),
+			}),
+			jsx(ProviderRow, { id: selectedId, provider: selectedProvider }, selectedId),
+		],
+	});
+}
+
 function ResetFormatControl() {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
@@ -1870,17 +1919,50 @@ function QuotaPane() {
 		const disabled = disabledProvidersAtom.get();
 		// Default view: only providers with real data. Providers without data
 		// (unconfigured / opt-in off) collapse into a muted "no data" section.
+		// Rows that share a base provider (saved pool accounts) are grouped:
+		// two or more sibling rows become one card group with a per-card
+		// button, while a lone row keeps the plain card path unchanged.
 		const all = providerEntries(data.providers).filter(
 			([pid]) => !disabled.includes(pid),
 		);
-		const withData = all.filter(([, p]) => isConfigured(p));
-		const withoutData = all.filter(([, p]) => !isConfigured(p));
+		const groups = [];
+		const groupByBase = new Map();
+		for (const entry of all) {
+			const base = baseProviderId(entry[0]);
+			if (!groupByBase.has(base)) {
+				const group = { base, entries: [], hasData: false };
+				groupByBase.set(base, group);
+				groups.push(group);
+			}
+			const group = groupByBase.get(base);
+			group.entries.push(entry);
+			group.hasData = group.hasData || Boolean(isConfigured(entry[1]));
+		}
+		// Providers without data (unconfigured / opt-in off) and without a
+		// sibling group collapse into the muted section, as before.
+		const visible = groups.filter(
+			(group) => group.entries.length >= 2 || group.hasData,
+		);
+		const withoutData = groups.filter(
+			(group) => group.entries.length === 1 && !group.hasData,
+		);
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
-				...withData.map(([id, p], index) =>
-					jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
-				),
+				...visible.map((group, index) => {
+					if (group.entries.length >= 2) {
+						return jsx(ProviderCardGroup, {
+							entries: group.entries,
+							key: group.base,
+						});
+					}
+					const [id, p] = group.entries[0];
+					return jsx(ProviderRow, {
+						id,
+						provider: p,
+						key: id === "openai-codex" ? `${id}-${index}` : id,
+					});
+				}),
 				withoutData.length > 0
 					? jsxs("details", {
 							className: "mt-1",
@@ -1892,9 +1974,14 @@ function QuotaPane() {
 								}),
 								jsx("div", {
 									className: "mt-1.5 flex flex-col gap-2",
-									children: withoutData.map(([id, p], index) =>
-										jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
-									),
+									children: withoutData.map((group, index) => {
+										const [id, p] = group.entries[0];
+										return jsx(ProviderRow, {
+											id,
+											provider: p,
+											key: id === "openai-codex" ? `${id}-${index}` : id,
+										});
+									}),
 								}),
 							],
 						})
