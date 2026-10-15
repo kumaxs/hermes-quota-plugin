@@ -14,15 +14,24 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .base import QuotaAccount, QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import (
+    GENERATED_ACCOUNT_ID_PREFIX,
+    QuotaAccount,
+    QuotaResult,
+    QuotaWindow,
+    build_unavailable,
+    urlopen_no_redirect,
+)
 from .registry import register as _register
 
 _PROVIDER = "commandcode"
@@ -34,6 +43,18 @@ _UA = "command-code/1.53.0"
 # cannot keep the CLI process alive after this deadline expires.
 _REQUEST_DEADLINE_S = 10.0
 _TIMEOUT = 5.0
+
+# Upper bounds for one multi-card sweep. At most _MAX_POOL_ROWS saved
+# credentials are read (the remainder becomes one typed ``config-limit`` row,
+# mirroring builtin's claudeAccounts cap) and at most _MAX_CONCURRENT_FETCHES
+# credential fetches run at once, so a large saved pool cannot fan out
+# unbounded threads or sockets inside the shared refresh budget.
+_MAX_POOL_ROWS = 8
+_MAX_CONCURRENT_FETCHES = 4
+_POOL_LIMIT_REASON = "config-limit"
+_POOL_LIMIT_DETAIL = (
+    f"Only the first {_MAX_POOL_ROWS} saved CommandCode credentials are read."
+)
 
 # planId -> (display name, monthly included credits in USD).  These IDs and
 # allowances mirror the official CLI 1.53.0 usage view.  In particular,
@@ -82,10 +103,21 @@ def _load_api_key() -> Optional[str]:
 
 
 def _clean_text(value: Any, limit: int = 64) -> str:
-    """Strip control characters and bound a saved row's display text."""
+    """Strip control characters and bound a saved row's display text.
+
+    Dropped: every Cc (C0/C1 controls, DEL), Cf (bidi/format characters such as
+    U+202E or zero-width joiners), Cs (lone surrogates) and Zl/Zp
+    line/paragraph separators. Truncation happens after filtering, so it cannot
+    split a surrogate pair into a lone surrogate. Display hardening only: the
+    widget still escapes the resulting text.
+    """
     if not isinstance(value, str):
         return ""
-    text = "".join(char for char in value if ord(char) >= 32 and ord(char) != 127)
+    text = "".join(
+        char
+        for char in value
+        if unicodedata.category(char) not in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+    )
     return text.strip()[:limit]
 
 
@@ -93,8 +125,10 @@ def _pool_rows_from_store() -> list[dict[str, Any]]:
     """Enumerate saved rows straight from ``auth.json`` (read-only fallback).
 
     Only used when the Hermes core is not importable. The profile pool wins
-    over the global one, mirroring the core's own precedence; an unreadable
-    store is an empty pool — never a write, never a fatal error.
+    over the global one, mirroring the core's own precedence; each store's
+    ``credential_pool`` is validated on its own, so a malformed profile pool is
+    an empty pool instead of an error that hides a valid global one — never a
+    write, never a fatal error.
     """
     try:
         from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -110,21 +144,29 @@ def _pool_rows_from_store() -> list[dict[str, Any]]:
         except (OSError, ValueError, UnicodeError):
             store = {}
         stores.append((home, store if isinstance(store, dict) else {}))
-    local_rows = (stores[0][1].get("credential_pool") or {}).get(_PROVIDER) if stores else []
-    global_rows = (
-        (stores[1][1].get("credential_pool") or {}).get(_PROVIDER) if len(stores) > 1 else []
-    )
-    entries = local_rows if isinstance(local_rows, list) and local_rows else global_rows
-    if not isinstance(entries, list):
-        return []
-    return [entry for entry in entries if isinstance(entry, dict)]
+
+    def rows_from(store: dict[str, Any]) -> list[dict[str, Any]]:
+        # Each store's pool is validated on its own: a non-object
+        # ``credential_pool`` (or a non-list provider entry) is an empty pool,
+        # never an error, and never hides the other store's rows.
+        pool = store.get("credential_pool")
+        entries = pool.get(_PROVIDER) if isinstance(pool, dict) else None
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    local_rows = rows_from(stores[0][1]) if stores else []
+    global_rows = rows_from(stores[1][1]) if len(stores) > 1 else []
+    return local_rows or global_rows
 
 
 def _pool_rows() -> list[dict[str, Any]]:
     """One row per saved CommandCode credential, without selecting/rotating.
 
-    The core reader is profile-aware and already resolves env-backed rows; the
-    direct read is the read-only fallback when the core is not importable.
+    The core reader is profile-aware; the direct read is the read-only fallback
+    when the core is not importable. The row source does not matter: env-backed
+    rows are re-resolved through the current env/dotenv precedence in
+    ``_credential_rows`` either way.
     """
     try:
         from hermes_cli.auth import read_credential_pool
@@ -146,20 +188,28 @@ def _env_secret(name: str) -> Optional[str]:
 def _credential_rows() -> list[tuple[Optional[str], str, str]]:
     """(account id, display label, secret) for every saved row, deduplicated.
 
-    Equality-only deduplication by secret: two rows that point at the same
-    credential are one card, and no id/hash/suffix is ever derived here.
+    Env-backed rows (``source`` starting with ``env:``) resolve through the
+    current native env/dotenv precedence first, so a rotated environment key
+    replaces a stale persisted token; the persisted token is only the fallback
+    when the environment value is missing. Equality-only deduplication by
+    secret: two rows that point at the same credential are one card, and no
+    id/hash/suffix is ever derived here.
     """
     rows: list[tuple[Optional[str], str, str]] = []
     seen: set[str] = set()
     for entry in _pool_rows():
-        secret = entry.get("access_token") or entry.get("runtime_api_key")
-        if not (isinstance(secret, str) and secret.strip()):
-            source = entry.get("source")
-            if isinstance(source, str) and source.startswith("env:"):
-                env_name = source.split(":", 1)[1].strip()
-                value = _env_secret(env_name) if env_name else None
-                secret = value if isinstance(value, str) and value.strip() else None
-        if not (isinstance(secret, str) and secret.strip()):
+        secret: Optional[str] = None
+        source = entry.get("source")
+        if isinstance(source, str) and source.startswith("env:"):
+            env_name = source.split(":", 1)[1].strip()
+            value = _env_secret(env_name) if env_name else None
+            if isinstance(value, str) and value.strip():
+                secret = value
+        if secret is None:
+            persisted = entry.get("access_token") or entry.get("runtime_api_key")
+            if isinstance(persisted, str) and persisted.strip():
+                secret = persisted
+        if secret is None:
             continue
         secret = secret.strip()
         if secret in seen:
@@ -394,10 +444,18 @@ def fetch_commandcode_quota() -> QuotaResult:
 
 def _fetch() -> QuotaResult:
     # Multi-card: two or more saved credential rows each get their own card
-    # (one saved pool row per card); zero or one rows keep the original
-    # single-card path unchanged.
-    rows = _credential_rows()
+    # (one saved pool row per card). A distinct CLI/core primary key is
+    # included as the plain base card; when it is missing or byte-equal to a
+    # saved row's credential it is deduped and the first saved row keeps the
+    # base card. Zero or one rows keep the original single-card path unchanged.
+    try:
+        rows = _credential_rows()
+    except Exception:  # noqa: BLE001 - optional enumeration must not sink a usable primary
+        rows = []
     if len(rows) >= 2:
+        primary = _load_api_key()
+        if primary and all(primary != secret for _account_id, _label, secret in rows):
+            return _fetch_cards(rows, primary=primary)
         return _fetch_cards(rows)
     key = _load_api_key()
     if not key:
@@ -499,36 +557,49 @@ def _fetch_card(key: str, deadline: float) -> QuotaResult:
     )
 
 
-def _fetch_cards(rows: list[tuple[Optional[str], str, str]]) -> QuotaResult:
-    """Fetch every saved row concurrently on one shared deadline.
+def _fetch_cards(
+    rows: list[tuple[Optional[str], str, str]], primary: Optional[str] = None
+) -> QuotaResult:
+    """Fetch the base credential and every accepted saved row on one deadline.
 
-    The first row keeps the plain ``commandcode`` row (its saved label becomes
-    ``account_label``); every other row becomes a named account row. One row's
-    failure is that row's typed unavailable card and never masks a sibling.
+    ``primary`` (when distinct) is the plain ``commandcode`` base card; else the
+    first accepted row fills the base role and its label becomes
+    ``account_label``. At most ``_MAX_POOL_ROWS`` saved rows are accepted — the
+    remainder becomes one typed ``config-limit`` row, never a silent drop.
+    Fetches run through a pool of at most ``_MAX_CONCURRENT_FETCHES`` workers,
+    so a huge saved pool cannot fan out unbounded requests. One row's failure
+    is that row's typed unavailable card and never masks a sibling.
     """
     deadline = time.monotonic() + _REQUEST_DEADLINE_S
-    results: list[Optional[QuotaResult]] = [None] * len(rows)
-    events: list[threading.Event] = []
+    accepted = rows[:_MAX_POOL_ROWS]
+    keys = [row[2] for row in accepted]
+    if primary is not None:
+        keys.insert(0, primary)
+    results: list[Optional[QuotaResult]] = [None] * len(keys)
+    events = [threading.Event() for _ in keys]
     lock = threading.Lock()
+    pending: queue.Queue[int] = queue.Queue()
+    for index in range(len(keys)):
+        pending.put(index)
 
-    def worker(index: int, key: str, event: threading.Event) -> None:
-        try:
-            card = _fetch_card(key, deadline)
-        except Exception as exc:  # one row must not sink its siblings
-            card = build_unavailable(_PROVIDER, f"fetch-error:{type(exc).__name__}")
-        with lock:
-            if results[index] is None:
-                results[index] = card
-        event.set()
+    def worker() -> None:
+        while True:
+            try:
+                index = pending.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                card = _fetch_card(keys[index], deadline)
+            except Exception as exc:  # one row must not sink its siblings
+                card = build_unavailable(_PROVIDER, f"fetch-error:{type(exc).__name__}")
+            with lock:
+                if results[index] is None:
+                    results[index] = card
+            events[index].set()
 
-    for index, (_account_id, _label, key) in enumerate(rows):
-        event = threading.Event()
-        events.append(event)
+    for slot in range(min(len(keys), _MAX_CONCURRENT_FETCHES)):
         threading.Thread(
-            target=worker,
-            args=(index, key, event),
-            name=f"commandcode-row{index}",
-            daemon=True,
+            target=worker, name=f"commandcode-row{slot}", daemon=True
         ).start()
     for event in events:
         event.wait(max(0.0, deadline - time.monotonic()))
@@ -537,8 +608,13 @@ def _fetch_cards(rows: list[tuple[Optional[str], str, str]]) -> QuotaResult:
     for index, event in enumerate(events):
         card = results[index] if event.is_set() else None
         cards.append(card if card is not None else build_unavailable(_PROVIDER, "timeout"))
+
     base = cards[0]
-    base.account_label = rows[0][1] or None
+    if primary is not None:
+        account_rows = accepted
+    else:
+        base.account_label = accepted[0][1] or None
+        account_rows = accepted[1:]
     base.accounts.extend(
         QuotaAccount(
             id=account_id,
@@ -548,8 +624,17 @@ def _fetch_cards(rows: list[tuple[Optional[str], str, str]]) -> QuotaResult:
             unavailable_reason=row_card.unavailable_reason,
             details=list(row_card.details or []),
         )
-        for (account_id, label, _key), row_card in zip(rows[1:], cards[1:])
+        for (account_id, label, _key), row_card in zip(account_rows, cards[1:])
     )
+    if len(rows) > len(accepted):
+        base.accounts.append(
+            QuotaAccount(
+                id=f"{GENERATED_ACCOUNT_ID_PREFIX}limit",
+                label="Additional credentials",
+                unavailable_reason=_POOL_LIMIT_REASON,
+                details=[_POOL_LIMIT_DETAIL],
+            )
+        )
     return base
 
 
